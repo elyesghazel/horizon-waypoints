@@ -1,18 +1,21 @@
-// Waypoints: named spots you save with a key or `/wp`, shown in the world
-// over where they are (name and distance) and in a list in a corner with an
-// arrow that points at each one. A death adds a waypoint where you died.
+// Waypoints: named spots you save with a key, keep in a menu of their own
+// (rename, recolour, delete) and find again: a marker over each one in the
+// world with its name and distance, and a list in a corner with an arrow that
+// points at each one. A death adds a waypoint where you died; `/wp` does it
+// all from chat too.
 // This file is both the mod's Cargo library (its tests) and the module the
 // bundle adds to the game.
 
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "waypoints";
 pub const NAME: &str = "Waypoints";
-pub const VERSION: &str = "1.0.0";
-pub const DESCRIPTION: &str = "Save spots with a key or /wp and find them again: markers in the world and a list with arrows. A death adds one too.";
+pub const VERSION: &str = "1.1.0";
+pub const DESCRIPTION: &str = "Save spots with N, manage them in a menu (U) and find them again: markers in the world and a list with arrows. A death adds one too.";
 /// Its keys: name, label and default key.
-pub const KEYS: [[&str; 3]; 2] = [
-    ["add", "Add a waypoint here", "key.keyboard.n"],
+pub const KEYS: [[&str; 3]; 3] = [
+    ["add", "New waypoint here", "key.keyboard.n"],
     ["toggle", "Show or hide waypoints", "key.keyboard.unknown"],
+    ["menu", "Waypoint menu", "key.keyboard.u"],
 ];
 /// The panel: translucent black, as the official mods' boxes.
 pub const BACKGROUND: u32 = 0x7800_0000;
@@ -168,6 +171,39 @@ impl Store {
             (1..=self.list.len()).contains(&n).then(|| n - 1)
         })?;
         Some(self.list.remove(i).name)
+    }
+
+    /// Renames waypoint `i`: an empty name keeps the old one, a name another
+    /// waypoint has gets a number after it.
+    pub fn rename(&mut self, i: usize, name: &str) {
+        let name = clean_name(name);
+        if i >= self.list.len() || name.is_empty() {
+            return;
+        }
+        let taken = |n: &str| {
+            self.list
+                .iter()
+                .enumerate()
+                .any(|(j, w)| j != i && w.name.eq_ignore_ascii_case(n))
+        };
+        let mut new = name.clone();
+        let mut k = 2;
+        while taken(&new) {
+            new = format!("{name} {k}");
+            k += 1;
+        }
+        self.list[i].name = new;
+    }
+
+    /// Waypoint `i` takes the palette's next colour.
+    pub fn cycle_color(&mut self, i: usize) {
+        if let Some(w) = self.list.get_mut(i) {
+            let at = PALETTE
+                .iter()
+                .position(|p| p.0 == w.color)
+                .map_or(0, |j| j + 1);
+            w.color = PALETTE[at % PALETTE.len()].0;
+        }
     }
 
     /// The waypoints in `dimension`, nearest first, with their distance.
@@ -406,6 +442,148 @@ pub fn block_of(p: [f64; 3]) -> [i32; 3] {
     ]
 }
 
+/// What can be clicked on the menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Button {
+    AddHere,
+    Shown,
+    Markers,
+    /// Row `i` of the store: its colour swatch, its name (rename), its
+    /// Rename button and its delete button.
+    Color(usize),
+    Name(usize),
+    Rename(usize),
+    Delete(usize),
+}
+
+/// The menu's places, in GUI pixels (`[x, y, w, h]`), for a `width` x
+/// `height` window, `rows` waypoints and the list scrolled by `scroll`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Layout {
+    pub panel: [f32; 4],
+    pub title_y: f32,
+    pub buttons: Vec<(Button, [f32; 4])>,
+    /// The rows shown: the store index and the row's rectangle.
+    pub rows: Vec<(usize, [f32; 4])>,
+    pub footer_y: f32,
+    /// How many rows fit.
+    pub fits: usize,
+}
+
+pub const ROW: f32 = 16.0;
+pub const BUTTON_H: f32 = 14.0;
+
+impl Layout {
+    pub fn new(width: f32, height: f32, rows: usize, scroll: usize) -> Self {
+        let w = (width - 16.0).clamp(160.0, 340.0);
+        let x = ((width - w) / 2.0).max(0.0);
+        let top = 12.0;
+        let title_y = top;
+        let bar_y = top + 14.0;
+        let third = (w - 8.0) / 3.0;
+        let mut buttons = vec![
+            (Button::AddHere, [x, bar_y, third, BUTTON_H]),
+            (Button::Shown, [x + third + 4.0, bar_y, third, BUTTON_H]),
+            (
+                Button::Markers,
+                [x + 2.0 * (third + 4.0), bar_y, third, BUTTON_H],
+            ),
+        ];
+        let list_y = bar_y + BUTTON_H + 8.0;
+        let footer_y = height - 14.0;
+        let fits = (((footer_y - 4.0 - list_y) / ROW).floor().max(1.0)) as usize;
+        let scroll = scroll.min(rows.saturating_sub(fits));
+        let mut shown = Vec::new();
+        for (slot, i) in (scroll..rows).take(fits).enumerate() {
+            let y = list_y + ROW * slot as f32;
+            shown.push((i, [x, y, w, ROW]));
+            let del = [x + w - BUTTON_H, y + 1.0, BUTTON_H, BUTTON_H];
+            let rename = [del[0] - 4.0 - 44.0, y + 1.0, 44.0, BUTTON_H];
+            buttons.push((Button::Color(i), [x + 2.0, y + 3.0, 10.0, 10.0]));
+            buttons.push((Button::Name(i), [x + 16.0, y, w * 0.4, ROW]));
+            buttons.push((Button::Rename(i), rename));
+            buttons.push((Button::Delete(i), del));
+        }
+        Self {
+            panel: [x - 6.0, top - 6.0, w + 12.0, footer_y + 12.0 - top],
+            title_y,
+            buttons,
+            rows: shown,
+            footer_y,
+            fits,
+        }
+    }
+    /// The button under `at`, if any.
+    pub fn hit(&self, at: [f32; 2]) -> Option<Button> {
+        self.buttons
+            .iter()
+            .find(|(_, r)| inside(*r, at))
+            .map(|b| b.0)
+    }
+}
+
+/// The character key `key.keyboard.n` types, for a letter or digit key.
+pub fn key_char(key: &str) -> Option<char> {
+    let rest = key.strip_prefix("key.keyboard.")?;
+    let mut chars = rest.chars();
+    let c = chars.next()?;
+    (chars.next().is_none() && c.is_ascii_alphanumeric()).then_some(c)
+}
+
+/// A top button's label.
+pub fn button_label(button: Button, settings: Settings) -> String {
+    let on = |b: bool| if b { "ON" } else { "OFF" };
+    match button {
+        Button::AddHere => "+ Add here".to_owned(),
+        Button::Shown => format!("Shown: {}", on(settings.shown)),
+        Button::Markers => format!("Markers: {}", on(settings.markers)),
+        Button::Rename(_) => "Rename".to_owned(),
+        Button::Delete(_) => "x".to_owned(),
+        Button::Color(_) | Button::Name(_) => String::new(),
+    }
+}
+
+/// `text` cut to `max` pixels by `width`, with `..` when cut.
+pub fn fit(text: &str, max: f32, width: impl Fn(&str) -> f32) -> String {
+    if width(text) <= max {
+        return text.to_owned();
+    }
+    let mut cut: String = text.to_owned();
+    while !cut.is_empty() && width(&format!("{cut}..")) > max {
+        cut.pop();
+    }
+    format!("{cut}..")
+}
+
+pub fn inside([x, y, w, h]: [f32; 4], [px, py]: [f32; 2]) -> bool {
+    px >= x && py >= y && px < x + w && py < y + h
+}
+
+/// The menu's own state while it is open.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ui {
+    /// The row being renamed and the text typed so far; `fresh` while the
+    /// first key will replace the whole name (a new waypoint's).
+    pub editing: Option<(usize, String, bool)>,
+    /// A delete clicked once: the second click deletes.
+    pub confirm_delete: Option<usize>,
+    pub scroll: usize,
+    /// Ask the next tick to close the menu (the click hooks can't).
+    pub close: bool,
+    /// The character of the key that opened the menu, which the game hands
+    /// the new screen right after: dropped once.
+    pub swallow: Option<char>,
+}
+
+/// What a key does on the menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuKey {
+    /// Swallowed: nothing else hears it.
+    Taken,
+    /// Left to the game (Escape closes the menu).
+    Passed,
+}
+
 /// The mod's state in the window's game: the waypoints and settings, read
 /// once from their files, and what the hooks last saw.
 #[derive(Clone, Debug, Default)]
@@ -416,6 +594,8 @@ pub struct State {
     pub camera: Option<([f64; 3], f32)>,
     /// The health last frame, to see a death.
     pub health: f32,
+    /// The menu, while it is open.
+    pub ui: Ui,
     loaded: bool,
 }
 
@@ -483,6 +663,149 @@ impl State {
         let mut files = vec![("list", self.store.write())];
         files.extend(self.settings().stored());
         files
+    }
+    /// The menu opens fresh; `rename` starts renaming that row at once.
+    pub fn open_menu(&mut self, rename: Option<usize>, key: &str) {
+        self.ui = Ui {
+            swallow: key_char(key),
+            ..Ui::default()
+        };
+        if let Some(i) = rename.filter(|&i| i < self.store.list.len()) {
+            self.ui.editing = Some((i, self.store.list[i].name.clone(), true));
+            // Scrolled so that the row is in view.
+            self.ui.scroll = i;
+        }
+    }
+    /// Ends a rename, keeping what was typed. True when something changed.
+    pub fn commit(&mut self) -> bool {
+        match self.ui.editing.take() {
+            Some((i, text, _)) => {
+                let before = self.store.list.get(i).map(|w| w.name.clone());
+                self.store.rename(i, &text);
+                before != self.store.list.get(i).map(|w| w.name.clone())
+            }
+            None => false,
+        }
+    }
+    /// A click on `button`; `here` is the player's dimension and block, for
+    /// Add here. True when the files should be kept.
+    pub fn click(&mut self, button: Option<Button>, here: Option<(&str, [i32; 3])>) -> bool {
+        // A click anywhere ends a rename (the name field itself keeps it).
+        let mut changed = match (button, &self.ui.editing) {
+            (Some(Button::Name(i)), Some((j, _, _))) if i == *j => return false,
+            _ => self.commit(),
+        };
+        if !matches!(button, Some(Button::Delete(_))) {
+            self.ui.confirm_delete = None;
+        }
+        let mut settings = self.settings();
+        match button {
+            Some(Button::AddHere) => {
+                if let Some((dimension, pos)) = here {
+                    self.store.add("", None, dimension, pos);
+                    let i = self.store.list.len() - 1;
+                    self.ui.editing = Some((i, self.store.list[i].name.clone(), true));
+                    self.ui.scroll = i;
+                    changed = true;
+                }
+            }
+            Some(Button::Shown) => {
+                settings.shown = !settings.shown;
+                changed = true;
+            }
+            Some(Button::Markers) => {
+                settings.markers = !settings.markers;
+                changed = true;
+            }
+            Some(Button::Color(i)) => {
+                self.store.cycle_color(i);
+                changed = true;
+            }
+            Some(Button::Name(i) | Button::Rename(i)) => {
+                if let Some(w) = self.store.list.get(i) {
+                    self.ui.editing = Some((i, w.name.clone(), false));
+                }
+            }
+            Some(Button::Delete(i)) => {
+                if self.ui.confirm_delete == Some(i) {
+                    if i < self.store.list.len() {
+                        self.store.list.remove(i);
+                        changed = true;
+                    }
+                    self.ui.confirm_delete = None;
+                } else {
+                    self.ui.confirm_delete = Some(i);
+                }
+            }
+            None => {}
+        }
+        self.settings = Some(settings);
+        changed
+    }
+    /// A key on the menu: Enter keeps a rename, Escape drops it, Backspace
+    /// takes a character back; the menu key closes the menu. Returns what
+    /// happens to the key and whether the files should be kept.
+    pub fn menu_key(&mut self, key: &str, menu_key: &str) -> (MenuKey, bool) {
+        self.ui.swallow = None;
+        if let Some((_, text, fresh)) = &mut self.ui.editing {
+            return match key {
+                "key.keyboard.enter" | "key.keyboard.keypad.enter" => {
+                    (MenuKey::Taken, self.commit())
+                }
+                "key.keyboard.escape" => {
+                    self.ui.editing = None;
+                    (MenuKey::Taken, false)
+                }
+                "key.keyboard.backspace" => {
+                    if *fresh {
+                        text.clear();
+                        *fresh = false;
+                    } else {
+                        text.pop();
+                    }
+                    (MenuKey::Taken, false)
+                }
+                // Every other key types (its character comes on its own).
+                _ => (MenuKey::Taken, false),
+            };
+        }
+        if key == menu_key {
+            self.ui.close = true;
+            return (MenuKey::Taken, false);
+        }
+        match key {
+            "key.keyboard.escape" => (MenuKey::Passed, false),
+            _ => (MenuKey::Taken, false),
+        }
+    }
+    /// A character typed on the menu: into the name being renamed.
+    pub fn typed(&mut self, c: char) {
+        if self
+            .ui
+            .swallow
+            .take()
+            .is_some_and(|k| k.eq_ignore_ascii_case(&c))
+        {
+            return;
+        }
+        if let Some((_, text, fresh)) = &mut self.ui.editing {
+            if *fresh {
+                text.clear();
+                *fresh = false;
+            }
+            if !c.is_control() && text.chars().count() < 32 {
+                text.push(c);
+            }
+        }
+    }
+    /// The wheel over the menu: up shows earlier rows.
+    pub fn scroll(&mut self, up: bool, fits: usize) {
+        let most = self.store.list.len().saturating_sub(fits);
+        self.ui.scroll = if up {
+            self.ui.scroll.saturating_sub(1)
+        } else {
+            (self.ui.scroll + 1).min(most)
+        };
     }
     /// True once when the health drops to 0 from above it.
     pub fn died(&mut self, health: f32) -> bool {
@@ -672,6 +995,120 @@ mod tests {
         assert!(!fresh.died(0.0));
     }
 
+    fn three() -> State {
+        let mut s = State::default();
+        for name in ["A", "B", "C"] {
+            s.store.add(name, None, "minecraft:overworld", [0, 64, 0]);
+        }
+        s
+    }
+
+    #[test]
+    fn menu_renames_by_typing() {
+        let mut s = three();
+        s.open_menu(Some(1), "key.keyboard.n");
+        // The opening key's own character is dropped.
+        s.typed('n');
+        assert_eq!(s.ui.editing, Some((1, "B".into(), true)));
+        // The first character replaces a fresh name.
+        for c in "Base".chars() {
+            s.typed(c);
+        }
+        s.menu_key("key.keyboard.backspace", "key.keyboard.u");
+        s.typed('e');
+        assert_eq!(
+            s.menu_key("key.keyboard.enter", "key.keyboard.u"),
+            (MenuKey::Taken, true)
+        );
+        assert_eq!(s.store.list[1].name, "Base");
+        assert_eq!(s.ui.editing, None);
+        // A taken name gets a number; Escape drops a rename.
+        s.click(Some(Button::Rename(0)), None);
+        s.typed('x');
+        s.menu_key("key.keyboard.backspace", "key.keyboard.u");
+        s.menu_key("key.keyboard.backspace", "key.keyboard.u");
+        for c in "base".chars() {
+            s.typed(c);
+        }
+        s.commit();
+        assert_eq!(s.store.list[0].name, "base 2");
+        s.click(Some(Button::Rename(2)), None);
+        s.typed('z');
+        assert_eq!(
+            s.menu_key("key.keyboard.escape", "key.keyboard.u"),
+            (MenuKey::Taken, false)
+        );
+        assert_eq!(s.store.list[2].name, "C");
+    }
+
+    #[test]
+    fn menu_keys_close_and_pass_escape() {
+        let mut s = three();
+        s.open_menu(None, "key.keyboard.u");
+        assert_eq!(
+            s.menu_key("key.keyboard.n", "key.keyboard.u"),
+            (MenuKey::Taken, false)
+        );
+        assert!(!s.ui.close);
+        assert_eq!(
+            s.menu_key("key.keyboard.escape", "key.keyboard.u").0,
+            MenuKey::Passed
+        );
+        s.menu_key("key.keyboard.u", "key.keyboard.u");
+        assert!(s.ui.close);
+    }
+
+    #[test]
+    fn menu_clicks() {
+        let mut s = three();
+        s.open_menu(None, "key.keyboard.u");
+        assert!(s.click(
+            Some(Button::AddHere),
+            Some(("minecraft:overworld", [1, 2, 3]))
+        ));
+        assert_eq!(s.store.list.len(), 4);
+        assert_eq!(s.ui.editing, Some((3, "Waypoint 1".into(), true)));
+        // Delete asks twice; another click in between forgets the first.
+        assert!(!s.click(Some(Button::Delete(0)), None));
+        assert_eq!(s.ui.confirm_delete, Some(0));
+        s.click(Some(Button::Shown), None);
+        assert!(!s.settings().shown);
+        assert!(!s.click(Some(Button::Delete(0)), None));
+        assert!(s.click(Some(Button::Delete(0)), None));
+        assert_eq!(s.store.list.len(), 3);
+        let before = s.store.list[0].color;
+        s.click(Some(Button::Color(0)), None);
+        assert_ne!(s.store.list[0].color, before);
+        s.click(Some(Button::Markers), None);
+        assert!(!s.settings().markers);
+    }
+
+    #[test]
+    fn layout_hits_and_scrolls() {
+        let l = Layout::new(400.0, 240.0, 20, 0);
+        assert!(l.fits >= 5 && l.fits < 20);
+        assert_eq!(l.rows[0].0, 0);
+        let [x, y, w, h] = l.buttons[0].1;
+        assert_eq!(l.hit([x + w / 2.0, y + h / 2.0]), Some(Button::AddHere));
+        let row = l.rows[1].1;
+        assert_eq!(
+            l.hit([row[0] + row[2] - 5.0, row[1] + 5.0]),
+            Some(Button::Delete(1))
+        );
+        assert_eq!(l.hit([0.0, 239.0]), None);
+        // Scrolled past the end, it stops at the last full page.
+        let end = Layout::new(400.0, 240.0, 20, 99);
+        assert_eq!(end.rows.last().unwrap().0, 19);
+        assert_eq!(end.rows.len(), end.fits);
+        let mut s = three();
+        s.scroll(false, 2);
+        s.scroll(false, 2);
+        assert_eq!(s.ui.scroll, 1);
+        s.scroll(true, 2);
+        s.scroll(true, 2);
+        assert_eq!(s.ui.scroll, 0);
+    }
+
     #[test]
     fn names_and_distances() {
         assert_eq!(clean_name("a\tb\nc"), "a b c");
@@ -681,5 +1118,10 @@ mod tests {
         assert_eq!(block_of([-0.5, 64.9, 3.2]), [-1, 64, 3]);
         assert_eq!(parse_color("GOLD"), Some(0xFF_AA00));
         assert_eq!(parse_color("#12345"), None);
+        assert_eq!(key_char("key.keyboard.n"), Some('n'));
+        assert_eq!(key_char("key.keyboard.enter"), None);
+        let w = |t: &str| t.len() as f32 * 6.0;
+        assert_eq!(fit("Base", 60.0, w), "Base");
+        assert_eq!(fit("A very long name", 60.0, w), "A very l..");
     }
 }
